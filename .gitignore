@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local secrets (API keys) — never commit
+backend/.env
+
+# Node
+node_modules/
+dist/
+*.local
+
+# Database & uploads
+data/*.db
+uploads/*
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
