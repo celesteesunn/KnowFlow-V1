@@ -31,6 +31,7 @@ def _public_user(row):
         "id": row["id"],
         "username": row["username"],
         "full_name": row["full_name"],
+        "is_admin": bool(row["is_admin"]),
     }
 
 
@@ -41,10 +42,16 @@ def register():
     password = data.get("password") or ""
     full_name = (data.get("full_name") or "").strip()
 
-    if len(username) < 3:
-        return jsonify({"error": "Username must be at least 3 characters"}), 400
+    if len(username) < 3 or len(username) > 50:
+        return jsonify({"error": "Username must be 3-50 characters"}), 400
+    if not all(c.isalnum() or c in "_-." for c in username):
+        return jsonify({"error": "Username may only contain letters, numbers, _ - ."}), 400
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if len(password) > 128:
+        return jsonify({"error": "Password is too long (max 128 characters)"}), 400
+    if len(full_name) > 100:
+        return jsonify({"error": "Full name is too long (max 100 characters)"}), 400
 
     conn = get_db()
     if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
@@ -57,7 +64,8 @@ def register():
     )
     conn.commit()
     user = conn.execute(
-        "SELECT id, username, full_name FROM users WHERE username = ?", (username,)
+        "SELECT id, username, full_name, is_admin FROM users WHERE username = ?",
+        (username,),
     ).fetchone()
     conn.close()
 
@@ -96,7 +104,7 @@ def me():
         return jsonify({"user": None})
     conn = get_db()
     user = conn.execute(
-        "SELECT id, username, full_name FROM users WHERE id = ?",
+        "SELECT id, username, full_name, is_admin FROM users WHERE id = ?",
         (session["user_id"],),
     ).fetchone()
     conn.close()

@@ -36,7 +36,7 @@ export default function Projects({ user, onOpen }) {
 
   return (
     <div>
-      <h1>Welcome, {user.full_name || user.username}</h1>
+      <h1>Projects</h1>
       <p className="tagline">Your knowledge projects</p>
 
       <div className="two-col">
@@ -63,7 +63,9 @@ export default function Projects({ user, onOpen }) {
 
         <section className="panel">
           <h2>Projects ({projects.length})</h2>
-          {projects.length === 0 && <p className="muted">No projects yet — create your first one.</p>}
+          {projects.length === 0 && (
+            <p className="muted">No projects yet — create your first one.</p>
+          )}
           <ul className="project-list">
             {projects.map((p) => (
               <li key={p.id} className="project-item" onClick={() => onOpen(p)}>

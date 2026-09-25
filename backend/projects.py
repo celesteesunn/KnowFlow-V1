@@ -18,8 +18,10 @@ def list_projects():
                (SELECT COUNT(*) FROM documents d WHERE d.project_id = p.id)
                    AS document_count
         FROM projects p
+        WHERE p.owner_id = ?
         ORDER BY p.created_at DESC
-        """
+        """,
+        (session["user_id"],),
     ).fetchall()
     conn.close()
     return jsonify({"projects": [dict(r) for r in rows]})

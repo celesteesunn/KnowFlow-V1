@@ -14,6 +14,19 @@ async function request(path, options = {}) {
   return data
 }
 
+// Multipart upload helper (file + optional metadata fields).
+async function upload(path, file, meta = {}) {
+  const form = new FormData()
+  form.append('file', file)
+  if (meta.title) form.append('title', meta.title)
+  if (meta.description) form.append('description', meta.description)
+  if (meta.category) form.append('category', meta.category)
+  const res = await fetch(path, { method: 'POST', body: form })
+  const data = await res.json().catch(() => ({}))
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
+  return data
+}
+
 export const api = {
   // Auth
   me: () => request('/api/auth/me'),
@@ -25,21 +38,37 @@ export const api = {
   projects: () => request('/api/projects'),
   createProject: (body) => request('/api/projects', { method: 'POST', body: JSON.stringify(body) }),
 
+  // Dashboard
+  dashboard: () => request('/api/dashboard'),
+
   // Documents
   documents: (projectId) => request(`/api/projects/${projectId}/documents`),
-  uploadDocument: (projectId, file) => {
-    const form = new FormData()
-    form.append('file', file)
-    return fetch(`/api/projects/${projectId}/documents`, { method: 'POST', body: form }).then(
-      async (res) => {
-        const data = await res.json().catch(() => ({}))
-        if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`)
-        return data
-      },
-    )
-  },
+  allDocuments: () => request('/api/documents'),
+  uploadDocument: (projectId, file, meta) =>
+    upload(`/api/projects/${projectId}/documents`, file, meta),
+  replaceDocument: (projectId, docId, file, meta) =>
+    upload(`/api/projects/${projectId}/documents/${docId}/replace`, file, meta),
+  documentDetail: (docId) => request(`/api/documents/${docId}`),
+  downloadUrl: (docId) => `/api/documents/${docId}/download`,
+  archiveDocument: (docId) => request(`/api/documents/${docId}`, { method: 'DELETE' }),
+  deleteDocument: (docId) =>
+    request(`/api/documents/${docId}/permanent`, { method: 'DELETE' }),
+
+  // Knowledge features
   search: (projectId, q) => request(`/api/projects/${projectId}/search?q=${encodeURIComponent(q)}`),
+  globalSearch: (q) => request(`/api/search?q=${encodeURIComponent(q)}`),
   ask: (projectId, question) =>
     request(`/api/projects/${projectId}/ask`, { method: 'POST', body: JSON.stringify({ question }) }),
+  chat: (projectId, question) =>
+    request('/api/chat', { method: 'POST', body: JSON.stringify({ project_id: projectId, question }) }),
   duplicates: (projectId) => request(`/api/projects/${projectId}/duplicates`),
+  relatedDocuments: (docId) =>
+    request(`/api/documents/${docId}/related`, { method: 'POST' }),
+  knowledgeGaps: () => request('/api/knowledge-gaps'),
+
+  // Admin
+  adminUsers: () => request('/api/admin/users'),
+  toggleAdmin: (userId) =>
+    request(`/api/admin/users/${userId}/admin`, { method: 'POST' }),
+  adminInsights: () => request('/api/admin/insights'),
 }
