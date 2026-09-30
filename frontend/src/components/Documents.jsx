@@ -1,16 +1,42 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api.js'
+import DocumentViewer from './DocumentViewer.jsx'
 
 export default function Documents({ onOpenDocument }) {
   const [docs, setDocs] = useState(null)
   const [error, setError] = useState(null)
+  const [viewing, setViewing] = useState(null)
+  const [busyId, setBusyId] = useState(null)
 
-  useEffect(() => {
+  const load = () => {
     api
       .allDocuments()
       .then((d) => setDocs(d.documents))
       .catch((e) => setError(e.message))
+  }
+
+  useEffect(() => {
+    load()
   }, [])
+
+  const onDelete = async (d) => {
+    if (
+      !window.confirm(
+        `Are you sure you want to delete "${d.title}"? This will permanently remove the document and all its versions.`,
+      )
+    )
+      return
+    setBusyId(d.id)
+    setError(null)
+    try {
+      await api.deleteDocument(d.id)
+      await load()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setBusyId(null)
+    }
+  }
 
   return (
     <div>
@@ -46,12 +72,24 @@ export default function Documents({ onOpenDocument }) {
                 >
                   Open
                 </button>
+                <button className="btn btn-small" onClick={() => setViewing(d)}>
+                  View
+                </button>
+                <button
+                  className="btn btn-small btn-danger"
+                  onClick={() => onDelete(d)}
+                  disabled={busyId === d.id}
+                >
+                  {busyId === d.id ? 'Deleting…' : 'Delete'}
+                </button>
               </div>
             </li>
           ))}
         </ul>
       )}
       {error && <p className="error-text">{error}</p>}
+
+      {viewing && <DocumentViewer doc={viewing} onClose={() => setViewing(null)} />}
     </div>
   )
 }

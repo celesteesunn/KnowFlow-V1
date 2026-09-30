@@ -1,14 +1,59 @@
 :root {
-  --bg: #0f172a;
-  --surface: #1e293b;
-  --surface-2: #273449;
-  --text: #e2e8f0;
-  --muted: #94a3b8;
-  --accent: #38bdf8;
-  --accent-2: #818cf8;
-  --ok: #34d399;
-  --error: #f87171;
-  --radius: 12px;
+  /* Palette — enterprise dark teal & muted green design system.
+     Deep navy teal base, dark teal surfaces, green accent, soft sage
+     supporting highlights. Green is an accent, never the dominant colour. */
+  --bg: #092328;            /* deep navy teal — page/sidebar/header background */
+  --surface: #0d2e31;       /* slightly lighter teal — cards, sections */
+  --surface-2: #12544f;     /* dark teal — chips, buttons, bubbles, secondary cards */
+  --surface-3: #17605a;     /* lighter dark teal — hover fills */
+  --text: #e8eef3;          /* soft off-white — primary text */
+  --muted: #8fa3b3;         /* muted blue-grey — secondary text */
+  --accent: #2a835f;        /* green — highlights, active states, primary actions */
+  --accent-2: #2f9469;      /* lighter green — hover on accent fills */
+  --ok: #8bbb92;            /* soft sage — success / active indicators */
+  --error: #c47f72;         /* muted warm red — errors (kept distinct) */
+  --border: rgba(139, 187, 146, 0.22);   /* muted sage-teal border */
+  --border-soft: rgba(139, 187, 146, 0.1); /* faint row dividers */
+  --on-accent: #f2f8f4;     /* light text on green fills */
+  --radius: 10px;
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+
+/* Light theme — same KnowFlow palette, light sage-tinted surfaces */
+[data-theme='light'] {
+  --bg: #f2f6f3;            /* light sage-tinted off-white — page background */
+  --surface: #ffffff;       /* white — cards, sections */
+  --surface-2: #e4ece6;     /* light sage — chips, buttons */
+  --surface-3: #d8e4db;     /* hover sage — button hover fills */
+  --text: #1c2a26;          /* deep teal-navy — primary text */
+  --muted: #5c6f68;         /* slate teal-grey — secondary text */
+  --accent: #2a835f;        /* green — highlights, selected states */
+  --accent-2: #24704f;      /* deeper green — hover on accent fills */
+  --ok: #3f7a5c;            /* deeper sage — success */
+  --error: #b4554a;         /* deeper warm red — errors */
+  --border: rgba(28, 42, 38, 0.16);
+  --border-soft: rgba(28, 42, 38, 0.08);
+  --on-accent: #ffffff;     /* white text on green fills */
+  --shadow-sm: 0 1px 3px rgba(28, 42, 38, 0.12);
+  --shadow-md: 0 4px 14px rgba(28, 42, 38, 0.14);
+}
+
+/* High contrast — stronger text and borders for readability */
+.high-contrast {
+  --muted: #d5e0e6;
+  --border: rgba(139, 187, 146, 0.55);
+  --border-soft: rgba(139, 187, 146, 0.28);
+  --ok: #a8cdb0;
+  --error: #e08a7a;
+}
+
+[data-theme='light'].high-contrast {
+  --muted: #33463e;
+  --border: rgba(28, 42, 38, 0.5);
+  --border-soft: rgba(28, 42, 38, 0.28);
+  --ok: #3f6b52;
+  --error: #a03f34;
 }
 
 * {
@@ -21,5 +66,7 @@ body {
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   background: var(--bg);
   color: var(--text);
-  line-height: 1.6;
+  font-size: 16px;
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
 }

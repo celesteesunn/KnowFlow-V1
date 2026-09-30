@@ -2,8 +2,8 @@
 search, ask and duplicate detection.
 
 Document management features:
-- PDF upload with metadata (title, description, category)
-- PDF validation (extension + readable content) and size limit
+- PDF, DOCX and TXT upload with metadata (title, description, category, tags)
+- File validation (extension + readable content) and a 500 MB per-file size limit
 - Per-project document list (current versions only)
 - Document details with version history
 - Download the stored PDF
@@ -15,17 +15,22 @@ Document management features:
 import hashlib
 import os
 import time
+import zipfile
+import xml.etree.ElementTree as ET
 
 from flask import Blueprint, jsonify, request, send_file, session
 from pypdf import PdfReader
 from werkzeug.utils import secure_filename
 
-from ai import generate_answer, retrieve_chunks, store_chunks
-from auth import login_required
-from config import ALLOWED_EXTENSIONS, DUPLICATE_THRESHOLD, UPLOAD_DIR
-from db import get_db
+from ai import ask_documents, store_chunks
+from auth import active_required, workspace_id
+from config import ALLOWED_EXTENSIONS, DUPLICATE_THRESHOLD, MAX_UPLOAD_MB, UPLOAD_DIR
+from db import get_db, log_activity
 
 bp = Blueprint("documents", __name__)
+
+# DOCX paragraphs live in word/document.xml; text is inside w:t elements.
+_DOCX_NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
 
 
 # --------------------------------------------------------------------------
@@ -42,8 +47,68 @@ def _extract_pdf(path):
     return pages
 
 
+def _extract_docx(path):
+    """Return [{page_number, text}] extracted from a DOCX (paragraphs +
+    table cells, in document order). Uses only the standard library."""
+    with zipfile.ZipFile(path) as zf:
+        xml_bytes = zf.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+
+    parts = []
+    for el in root.iter():
+        if el.tag == f"{{{_DOCX_NS['w']}}}p":
+            text = "".join(
+                t.text or ""
+                for t in el.iter(f"{{{_DOCX_NS['w']}}}t")
+            ).strip()
+            if text:
+                parts.append(text)
+    if not parts:
+        return []
+    return [{"page_number": 1, "text": "\n".join(parts)}]
+
+
+def _extract_txt(path):
+    """Return [{page_number, text}] extracted from a plain-text file."""
+    raw = open(path, "rb").read()
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = raw.decode("utf-8", errors="replace")
+    text = text.strip()
+    if not text:
+        return []
+    return [{"page_number": 1, "text": text}]
+
+
+def _extract_by_ext(path, ext):
+    if ext == ".pdf":
+        return _extract_pdf(path)
+    if ext == ".docx":
+        return _extract_docx(path)
+    if ext == ".txt":
+        return _extract_txt(path)
+    raise ValueError("Unsupported file type")
+
+
+def _too_large_message():
+    """User-friendly message for an over-limit upload.
+
+    Shared by the Content-Length check, the streamed byte count and the
+    413 handler in app.py so every rejection reads the same.
+    """
+    return (
+        "File too large. The maximum allowed file size is "
+        f"{MAX_UPLOAD_MB} MB. Please choose a smaller file."
+    )
+
+
 def _save_and_extract(file, project_id):
-    """Validate and store an uploaded PDF, then extract its text.
+    """Validate and store an uploaded file, then extract its text.
 
     Raises ValueError with a user-friendly message on invalid input.
     Returns (filename, save_path, pages, full_text, content_hash).
@@ -53,24 +118,63 @@ def _save_and_extract(file, project_id):
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise ValueError("Only PDF files are allowed")
+        raise ValueError("Only PDF, DOCX or TXT files are allowed")
 
-    filename = secure_filename(file.filename) or "document.pdf"
+    filename = secure_filename(file.filename) or f"document{ext}"
     save_path = os.path.join(
         UPLOAD_DIR, f"{project_id}_{int(time.time() * 1000)}_{filename}"
     )
-    file.save(save_path)
+
+    # Enforce the per-file size limit. Content-Length is checked first when
+    # the client sent one, then the body is streamed to disk while counting
+    # bytes, so a request that omits or misreports Content-Length is still
+    # rejected once the real size passes the limit.
+    max_bytes = MAX_UPLOAD_MB * 1024 * 1024
+    declared = getattr(file, "content_length", None)
+    try:
+        declared_bytes = int(declared) if declared is not None else None
+    except (TypeError, ValueError):
+        declared_bytes = None
+    if declared_bytes is not None and declared_bytes > max_bytes:
+        raise ValueError(_too_large_message())
+
+    written = 0
+    try:
+        with open(save_path, "wb") as out:
+            while True:
+                chunk = file.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > max_bytes:
+                    raise ValueError(_too_large_message())
+                out.write(chunk)
+    except ValueError:
+        # Oversized (or unreadable) upload: never leave a partial file behind.
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
+        raise
+    except Exception:
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except OSError:
+                pass
+        raise ValueError("Invalid or corrupted file")
 
     try:
-        pages = _extract_pdf(save_path)
+        pages = _extract_by_ext(save_path, ext)
     except Exception:
         os.remove(save_path)
-        raise ValueError("Invalid or corrupted PDF file")
+        raise ValueError("Invalid or corrupted file")
 
     full_text = "\n\n".join(p["text"] for p in pages)
     if not full_text.strip():
         os.remove(save_path)
-        raise ValueError("No readable text found in the PDF")
+        raise ValueError("No readable text found in the file")
     content_hash = hashlib.sha256(full_text.encode("utf-8")).hexdigest()
     return filename, save_path, pages, full_text, content_hash
 
@@ -82,6 +186,7 @@ def _doc_summary(row):
         "title": row["title"],
         "description": row["description"],
         "category": row["category"],
+        "tags": row["tags"] or "",
         "project_id": row["project_id"],
         "page_count": row["page_count"],
         "version": row["version"],
@@ -91,22 +196,24 @@ def _doc_summary(row):
 
 
 def _project_owned(conn, project_id):
-    """True if the signed-in user owns the project."""
+    """True if the signed-in user owns the project (same workspace)."""
+    ws_id = workspace_id(conn)
     return conn.execute(
-        "SELECT 1 FROM projects WHERE id = ? AND owner_id = ?",
-        (project_id, session["user_id"]),
+        "SELECT 1 FROM projects WHERE id = ? AND owner_id = ? AND workspace_id = ?",
+        (project_id, session["user_id"], ws_id),
     ).fetchone() is not None
 
 
 def _document_owned(conn, doc_id):
-    """True if the signed-in user owns the document's project."""
+    """True if the signed-in user owns the document's project (same workspace)."""
+    ws_id = workspace_id(conn)
     return conn.execute(
         """
         SELECT 1 FROM documents d
         JOIN projects p ON p.id = d.project_id
-        WHERE d.id = ? AND p.owner_id = ?
+        WHERE d.id = ? AND p.owner_id = ? AND p.workspace_id = ?
         """,
-        (doc_id, session["user_id"]),
+        (doc_id, session["user_id"], ws_id),
     ).fetchone() is not None
 
 
@@ -149,18 +256,26 @@ def _check_duplicates(conn, project_id, new_doc_id, full_text):
 
 
 def _insert_document(conn, project_id, filename, save_path, pages, full_text,
-                     content_hash, title, description, category, version,
+                     content_hash, title, description, category, tags, version,
                      doc_group_id):
+    # The document inherits its workspace from the project, so a document
+    # can never be created in a workspace the project does not belong to.
+    ws_row = conn.execute(
+        "SELECT workspace_id FROM projects WHERE id = ?", (project_id,)
+    ).fetchone()
+    ws_id = ws_row["workspace_id"] if ws_row else None
     cur = conn.execute(
         """
         INSERT INTO documents
-            (project_id, filename, file_path, page_count, uploaded_by, text,
-             content_hash, title, description, category, version,
-             processing_status, is_current, is_archived, doc_group_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', 1, 0, ?)
+            (project_id, workspace_id, filename, file_path, page_count,
+             uploaded_by, text, content_hash, title, description, category,
+             tags, version, processing_status, is_current, is_archived,
+             doc_group_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', 1, 0, ?)
         """,
         (
             project_id,
+            ws_id,
             filename,
             save_path,
             len(pages),
@@ -170,6 +285,7 @@ def _insert_document(conn, project_id, filename, save_path, pages, full_text,
             title,
             description,
             category,
+            tags,
             version,
             doc_group_id,
         ),
@@ -180,8 +296,10 @@ def _insert_document(conn, project_id, filename, save_path, pages, full_text,
             "INSERT INTO document_pages (document_id, page_number, text) VALUES (?, ?, ?)",
             (doc_id, p["page_number"], p["text"]),
         )
-    # Chunk + embed the extracted text for RAG retrieval.
-    store_chunks(conn, doc_id, pages)
+    # Chunk + embed the extracted text for RAG retrieval. The filename is
+    # passed so the chunker can use the document's own title as context when
+    # a page's text does not repeat it.
+    store_chunks(conn, doc_id, pages, filename)
     return doc_id
 
 
@@ -190,7 +308,7 @@ def _insert_document(conn, project_id, filename, save_path, pages, full_text,
 # --------------------------------------------------------------------------
 
 @bp.post("/api/projects/<int:project_id>/documents")
-@login_required
+@active_required
 def upload_document(project_id):
     conn = get_db()
     if not _project_owned(conn, project_id):
@@ -208,16 +326,21 @@ def upload_document(project_id):
     title = (request.form.get("title") or "").strip() or os.path.splitext(filename)[0]
     description = (request.form.get("description") or "").strip()
     category = (request.form.get("category") or "").strip()
+    tags = (request.form.get("tags") or "").strip()
 
     conn = get_db()
     doc_id = _insert_document(
         conn, project_id, filename, save_path, pages, full_text, content_hash,
-        title, description, category, version=1, doc_group_id=None,
+        title, description, category, tags, version=1, doc_group_id=None,
     )
     # A new document is its own version group.
     conn.execute("UPDATE documents SET doc_group_id = ? WHERE id = ?", (doc_id, doc_id))
     # Part 2 — duplicate detection: compare with existing documents.
     potentially_similar = _check_duplicates(conn, project_id, doc_id, full_text)
+    log_activity(
+        conn, session["user_id"], "document_upload",
+        f'Uploaded "{title}"', ref_type="document", ref_id=doc_id,
+    )
     conn.commit()
     row = conn.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
     conn.close()
@@ -231,9 +354,10 @@ def upload_document(project_id):
 # --------------------------------------------------------------------------
 
 @bp.get("/api/documents")
-@login_required
+@active_required
 def all_documents():
     conn = get_db()
+    ws_id = workspace_id(conn)
     rows = conn.execute(
         """
         SELECT d.id, d.filename, d.title, d.version, d.processing_status,
@@ -243,10 +367,11 @@ def all_documents():
         FROM documents d
         JOIN projects p ON p.id = d.project_id
         JOIN users u ON u.id = d.uploaded_by
-        WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
+        WHERE p.owner_id = ? AND p.workspace_id = ?
+          AND d.is_current = 1 AND d.is_archived = 0
         ORDER BY d.created_at DESC
         """,
-        (session["user_id"],),
+        (session["user_id"], ws_id),
     ).fetchall()
     conn.close()
     return jsonify({"documents": [dict(r) for r in rows]})
@@ -257,7 +382,7 @@ def all_documents():
 # --------------------------------------------------------------------------
 
 @bp.get("/api/projects/<int:project_id>/documents")
-@login_required
+@active_required
 def list_documents(project_id):
     conn = get_db()
     if not _project_owned(conn, project_id):
@@ -284,7 +409,7 @@ def list_documents(project_id):
 # --------------------------------------------------------------------------
 
 @bp.get("/api/documents/<int:doc_id>")
-@login_required
+@active_required
 def document_detail(doc_id):
     conn = get_db()
     if not _document_owned(conn, doc_id):
@@ -338,7 +463,7 @@ def document_detail(doc_id):
 
 
 @bp.get("/api/documents/<int:doc_id>/download")
-@login_required
+@active_required
 def download_document(doc_id):
     conn = get_db()
     if not _document_owned(conn, doc_id):
@@ -357,27 +482,90 @@ def download_document(doc_id):
     )
 
 
+@bp.get("/api/documents/<int:doc_id>/view")
+@active_required
+def view_document(doc_id):
+    """Serve the stored file inline so the browser can render it inside the
+    application (embedded viewer). Unlike /download this is not an
+    attachment, so PDFs open in the page rather than being saved."""
+    conn = get_db()
+    if not _document_owned(conn, doc_id):
+        conn.close()
+        return jsonify({"error": "Document not found"}), 404
+    row = conn.execute(
+        "SELECT filename, file_path FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()
+    log_activity(
+        conn, session["user_id"], "document_view",
+        f'Viewed "{row["filename"]}"' if row else "Viewed a document",
+        ref_type="document", ref_id=doc_id,
+    )
+    conn.commit()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Document not found"}), 404
+    if not os.path.exists(row["file_path"]):
+        return jsonify({"error": "File missing on disk"}), 404
+    ext = os.path.splitext(row["filename"])[1].lower()
+    mimetype = {
+        ".pdf": "application/pdf",
+        ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ".txt": "text/plain; charset=utf-8",
+    }.get(ext, "application/octet-stream")
+    return send_file(
+        row["file_path"],
+        as_attachment=False,
+        mimetype=mimetype,
+        download_name=row["filename"],
+    )
+
+
+@bp.get("/api/documents/<int:doc_id>/text")
+@active_required
+def document_text(doc_id):
+    """Return the extracted text of a document (for non-PDF viewing).
+
+    The text is the same extracted content used for search and RAG, so the
+    viewer never needs to parse the original file format.
+    """
+    conn = get_db()
+    if not _document_owned(conn, doc_id):
+        conn.close()
+        return jsonify({"error": "Document not found"}), 404
+    row = conn.execute(
+        "SELECT filename, text FROM documents WHERE id = ?", (doc_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({"error": "Document not found"}), 404
+    return jsonify({"filename": row["filename"], "text": row["text"] or ""})
+
+
 @bp.delete("/api/documents/<int:doc_id>")
-@login_required
+@active_required
 def archive_document(doc_id):
     conn = get_db()
     if not _document_owned(conn, doc_id):
         conn.close()
         return jsonify({"error": "Document not found"}), 404
     row = conn.execute(
-        "SELECT id FROM documents WHERE id = ? AND is_archived = 0", (doc_id,)
+        "SELECT id, filename FROM documents WHERE id = ? AND is_archived = 0", (doc_id,)
     ).fetchone()
     if not row:
         conn.close()
         return jsonify({"error": "Document not found"}), 404
     conn.execute("UPDATE documents SET is_archived = 1 WHERE id = ?", (doc_id,))
+    log_activity(
+        conn, session["user_id"], "document_archive",
+        f'Archived "{row["filename"]}"', ref_type="document", ref_id=doc_id,
+    )
     conn.commit()
     conn.close()
     return jsonify({"ok": True})
 
 
 @bp.delete("/api/documents/<int:doc_id>/permanent")
-@login_required
+@active_required
 def delete_document(doc_id):
     """Permanently delete a document and every version in its group.
 
@@ -415,6 +603,10 @@ def delete_document(doc_id):
         (group,),
     )
     conn.execute("DELETE FROM documents WHERE doc_group_id = ?", (group,))
+    log_activity(
+        conn, session["user_id"], "document_delete",
+        f'Deleted "{row["filename"]}"', ref_type="document", ref_id=row["id"],
+    )
     conn.commit()
     conn.close()
 
@@ -435,7 +627,7 @@ def delete_document(doc_id):
 # --------------------------------------------------------------------------
 
 @bp.post("/api/projects/<int:project_id>/documents/<int:doc_id>/replace")
-@login_required
+@active_required
 def replace_document(project_id, doc_id):
     conn = get_db()
     if not _project_owned(conn, project_id):
@@ -469,13 +661,19 @@ def replace_document(project_id, doc_id):
     title = (request.form.get("title") or "").strip() or target["title"]
     description = (request.form.get("description") or "").strip() or target["description"]
     category = (request.form.get("category") or "").strip() or target["category"]
+    tags = (request.form.get("tags") or "").strip() or target["tags"] or ""
 
     # Previous versions stay in the database and on disk; only the current
     # flag moves to the new version.
     conn.execute("UPDATE documents SET is_current = 0 WHERE doc_group_id = ?", (group,))
     new_id = _insert_document(
         conn, project_id, filename, save_path, pages, full_text, content_hash,
-        title, description, category, version=new_version, doc_group_id=group,
+        title, description, category, tags, version=new_version, doc_group_id=group,
+    )
+    log_activity(
+        conn, session["user_id"], "document_update",
+        f'Updated "{title}" to version {new_version}',
+        ref_type="document", ref_id=new_id,
     )
     conn.commit()
     row = conn.execute("SELECT * FROM documents WHERE id = ?", (new_id,)).fetchone()
@@ -488,7 +686,7 @@ def replace_document(project_id, doc_id):
 # --------------------------------------------------------------------------
 
 @bp.get("/api/projects/<int:project_id>/search")
-@login_required
+@active_required
 def search(project_id):
     q = (request.args.get("q") or "").strip()
     if not q:
@@ -526,6 +724,11 @@ def search(project_id):
                 "snippet": snippet,
             }
         )
+    log_activity(
+        conn, session["user_id"], "search",
+        f'Searched for "{q}"', ref_type="project", ref_id=project_id,
+    )
+    conn.commit()
     conn.close()
     return jsonify({"results": results})
 
@@ -535,7 +738,7 @@ def search(project_id):
 # --------------------------------------------------------------------------
 
 @bp.post("/api/projects/<int:project_id>/ask")
-@login_required
+@active_required
 def ask(project_id):
     data = request.get_json(force=True)
     question = (data.get("question") or "").strip()
@@ -548,32 +751,27 @@ def ask(project_id):
     if not _project_owned(conn, project_id):
         conn.close()
         return jsonify({"error": "Project not found"}), 404
-    hits = retrieve_chunks(conn, project_id, question)
+
+    # Same pipeline as /api/chat, so a question asked from the project page
+    # and the same question asked in the assistant panel retrieve identically.
+    result = ask_documents(
+        conn, session["user_id"], workspace_id(conn), project_id, question
+    )
+    log_activity(
+        conn, session["user_id"], "ai_question",
+        f'Asked the AI: "{question}"', ref_type="project", ref_id=project_id,
+    )
+    conn.commit()
     conn.close()
 
-    if not hits:
-        return jsonify(
-            {
-                "answer": "No relevant content found in this project's documents.",
-                "sources": [],
-                "mode": "none",
-            }
-        )
-
-    result = generate_answer(question, hits)
-    sources = [
-        {
-            "document": h["filename"],
-            "page": h["page_number"],
-            "score": round(h["score"], 3),
-        }
-        for h in hits
-    ]
+    # Document and page only: similarity scores and raw chunk text are
+    # retrieval internals and are not sent to the client.
     return jsonify(
         {
             "answer": result["answer"],
             "mode": result["mode"],
-            "sources": sources,
+            "sources": result["sources"],
+            "intent": result["intent"],
         }
     )
 
@@ -583,7 +781,7 @@ def ask(project_id):
 # --------------------------------------------------------------------------
 
 @bp.get("/api/projects/<int:project_id>/duplicates")
-@login_required
+@active_required
 def duplicates(project_id):
     conn = get_db()
     if not _project_owned(conn, project_id):

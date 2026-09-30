@@ -2,15 +2,37 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import Chat from './Chat.jsx'
 import DocumentDetail from './DocumentDetail.jsx'
+import DocumentViewer from './DocumentViewer.jsx'
+
+// Upload limits — keep in sync with backend config.py (MAX_UPLOAD_MB,
+// ALLOWED_EXTENSIONS). Only values the backend actually accepts are shown.
+const MAX_UPLOAD_MB = 500
+const ALLOWED_EXTENSIONS = ['.pdf', '.docx', '.txt']
+const MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+const tooLarge = (name) =>
+  `${name}: file too large. The maximum allowed file size is ` +
+  `${MAX_UPLOAD_MB} MB. Please choose a smaller file.`
+
+const badType = (name) => `${name}: only PDF, DOCX or TXT files are allowed.`
+
+// Check a file locally so an over-limit file is never sent to the server.
+const rejectReason = (file) => {
+  const ext = `.${file.name.split('.').pop().toLowerCase()}`
+  if (!ALLOWED_EXTENSIONS.includes(ext)) return badType(file.name)
+  if (file.size > MAX_BYTES) return tooLarge(file.name)
+  return null
+}
 
 export default function ProjectDetail({ project, onBack }) {
   const [documents, setDocuments] = useState([])
   const [selectedDoc, setSelectedDoc] = useState(null)
+  const [viewing, setViewing] = useState(null)
   const [chatOpen, setChatOpen] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadMsg, setUploadMsg] = useState(null)
   const [uploadError, setUploadError] = useState(null)
-  const [uploadForm, setUploadForm] = useState({ title: '', description: '', category: '' })
+  const [uploadForm, setUploadForm] = useState({ title: '', description: '', category: '', tags: '' })
   const [query, setQuery] = useState('')
   const [results, setResults] = useState(null)
   const [dups, setDups] = useState(null)
@@ -30,27 +52,49 @@ export default function ProjectDetail({ project, onBack }) {
   }, [project.id])
 
   const upload = async (e) => {
-    const file = e.target.files[0]
-    if (!file) return
+    const files = Array.from(e.target.files || [])
+    if (files.length === 0) return
     setUploading(true)
     setUploadMsg(null)
     setUploadError(null)
+
+    // The 500 MB limit is applied to each selected file on its own, so one
+    // oversized file is rejected by name while the rest still upload.
+    const valid = []
+    const rejected = []
+    for (const file of files) {
+      const reason = rejectReason(file)
+      if (reason) rejected.push(reason)
+      else valid.push(file)
+    }
+
+    const notes = []
+    let uploaded = 0
     try {
-      const res = await api.uploadDocument(project.id, file, uploadForm)
-      let msg = `Uploaded ${res.document.title} (v${res.document.version})`
-      if (res.potentially_similar && res.potentially_similar.length > 0) {
-        const top = res.potentially_similar[0]
-        msg += ` — Possible duplicate detected: ${top.filename} — ${Math.round(
-          top.similarity * 100,
-        )}% similarity. Potentially similar document.`
+      for (const file of valid) {
+        try {
+          const res = await api.uploadDocument(project.id, file, uploadForm)
+          let msg = `Uploaded ${res.document.title} (v${res.document.version})`
+          if (res.potentially_similar && res.potentially_similar.length > 0) {
+            const top = res.potentially_similar[0]
+            msg += ` — Possible duplicate detected: ${top.filename} — ${Math.round(
+              top.similarity * 100,
+            )}% similarity. Potentially similar document.`
+          }
+          notes.push(msg)
+          uploaded += 1
+        } catch (err) {
+          rejected.push(`${file.name}: ${err.message}`)
+        }
       }
-      setUploadMsg(msg)
-      setUploadForm({ title: '', description: '', category: '' })
-      e.target.value = ''
-      await loadDocs()
-    } catch (err) {
-      setUploadError(err.message)
     } finally {
+      if (uploaded > 0) {
+        setUploadMsg(notes.join(' '))
+        setUploadForm({ title: '', description: '', category: '', tags: '' })
+        await loadDocs()
+      }
+      if (rejected.length > 0) setUploadError(rejected.join(' '))
+      e.target.value = ''
       setUploading(false)
     }
   }
@@ -59,6 +103,12 @@ export default function ProjectDetail({ project, onBack }) {
     const file = e.target.files[0]
     if (!file) return
     setError(null)
+    const reason = rejectReason(file)
+    if (reason) {
+      setError(reason)
+      e.target.value = ''
+      return
+    }
     try {
       const res = await api.replaceDocument(project.id, docId, file, {})
       setUploadMsg(`Replaced with version ${res.version}`)
@@ -142,7 +192,7 @@ export default function ProjectDetail({ project, onBack }) {
       {project.description && <p className="tagline">{project.description}</p>}
 
       <section className="panel">
-        <h2>Upload PDF</h2>
+        <h2>Upload document</h2>
         <div className="upload-form">
           <input
             placeholder="Title (defaults to filename)"
@@ -160,13 +210,23 @@ export default function ProjectDetail({ project, onBack }) {
             onChange={(e) => setUploadForm({ ...uploadForm, category: e.target.value })}
           />
           <input
+            placeholder="Tags (optional, comma separated)"
+            value={uploadForm.tags}
+            onChange={(e) => setUploadForm({ ...uploadForm, tags: e.target.value })}
+          />
+          <input
             ref={fileInput}
             type="file"
-            accept=".pdf"
+            accept=".pdf,.docx,.txt"
+            multiple
             onChange={upload}
             disabled={uploading}
           />
         </div>
+        <p className="muted">
+          Maximum file size: {MAX_UPLOAD_MB} MB per file · Supported formats:{' '}
+          {ALLOWED_EXTENSIONS.map((x) => x.slice(1).toUpperCase()).join(', ')}
+        </p>
         {uploading && <p className="muted">Uploading and extracting text…</p>}
         {uploadMsg && <p className="ok-text">{uploadMsg}</p>}
         {uploadError && <p className="error-text">{uploadError}</p>}
@@ -174,7 +234,9 @@ export default function ProjectDetail({ project, onBack }) {
 
       <section className="panel">
         <h2>Documents ({documents.length})</h2>
-        {documents.length === 0 && <p className="muted">No documents yet — upload a PDF above.</p>}
+        {documents.length === 0 && (
+          <p className="muted">No documents yet — upload a PDF, DOCX or TXT above.</p>
+        )}
         <ul className="doc-list">
           {documents.map((d) => (
             <li key={d.id} className="doc-item">
@@ -193,7 +255,7 @@ export default function ProjectDetail({ project, onBack }) {
                 </span>
               </div>
               <div className="doc-actions">
-                <button className="btn btn-small" onClick={() => setSelectedDoc(d.id)}>
+                <button className="btn btn-small" onClick={() => setViewing(d)}>
                   View
                 </button>
                 <a className="btn btn-small" href={api.downloadUrl(d.id)}>
@@ -214,7 +276,7 @@ export default function ProjectDetail({ project, onBack }) {
                 <input
                   ref={(el) => (replaceInputs.current[d.id] = el)}
                   type="file"
-                  accept=".pdf"
+                  accept=".pdf,.docx,.txt"
                   style={{ display: 'none' }}
                   onChange={(e) => onReplaceFile(d.id, e)}
                 />
@@ -281,6 +343,8 @@ export default function ProjectDetail({ project, onBack }) {
       </section>
 
       {error && <p className="error-text">{error}</p>}
+
+      {viewing && <DocumentViewer doc={viewing} onClose={() => setViewing(null)} />}
     </div>
   )
 }

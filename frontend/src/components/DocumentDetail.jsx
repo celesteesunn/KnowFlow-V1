@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 
+// Upload limit — keep in sync with backend config.py (MAX_UPLOAD_MB).
+const MAX_UPLOAD_MB = 500
+const MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
 export default function DocumentDetail({ docId, projectId, onBack, onChanged }) {
   const [currentId, setCurrentId] = useState(docId)
   const [detail, setDetail] = useState(null)
@@ -28,9 +32,18 @@ export default function DocumentDetail({ docId, projectId, onBack, onChanged }) 
   const onReplaceFile = async (e) => {
     const file = e.target.files[0]
     if (!file) return
-    setBusy(true)
     setError(null)
     setMsg(null)
+    // Checked locally so a file over the limit is never sent to the server.
+    if (file.size > MAX_BYTES) {
+      setError(
+        `${file.name}: file too large. The maximum allowed file size is ` +
+          `${MAX_UPLOAD_MB} MB. Please choose a smaller file.`,
+      )
+      e.target.value = ''
+      return
+    }
+    setBusy(true)
     try {
       const res = await api.replaceDocument(projectId, currentId, file, {})
       setMsg(`Replaced with version ${res.version}`)
@@ -145,7 +158,7 @@ export default function DocumentDetail({ docId, projectId, onBack, onChanged }) 
 
         <div className="actions">
           <a className="btn btn-primary" href={api.downloadUrl(currentId)}>
-            Download PDF
+            Download
           </a>
           <button className="btn" onClick={() => replaceInput.current.click()} disabled={busy}>
             Replace document
@@ -159,7 +172,7 @@ export default function DocumentDetail({ docId, projectId, onBack, onChanged }) 
           <input
             ref={replaceInput}
             type="file"
-            accept=".pdf"
+            accept=".pdf,.docx,.txt"
             style={{ display: 'none' }}
             onChange={onReplaceFile}
           />

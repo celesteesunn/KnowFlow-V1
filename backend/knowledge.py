@@ -4,25 +4,28 @@
 - POST /api/documents/<id>/related   semantically similar documents (owner only)
 - GET  /api/knowledge-gaps    frequently unanswered AI questions (admin only)
 
-All queries are scoped to projects owned by the signed-in user, so users can
-only ever see their own authorised documents.
+All queries are scoped to projects owned by the signed-in user AND inside
+the user's workspace, so users can only ever see their own authorised
+documents and never content from another organisation workspace.
 """
 
 from flask import Blueprint, jsonify, request, session
 
-from auth import login_required
+from auth import active_required, is_admin, workspace_id
 from config import DUPLICATE_THRESHOLD
-from db import get_db
+from db import get_db, log_activity
+from search import hybrid_search
 
 # Only show documents with at least 10% similarity as "related".
 RELATED_MIN_SIMILARITY = 0.1
 
 
-def _duplicate_pairs(conn, uid=None, limit=10):
+def _duplicate_pairs(conn, uid=None, ws_id=None, limit=10):
     """Find near-duplicate document pairs (TF-IDF cosine similarity).
 
-    uid=None scans every project (admin insights); otherwise only the
-    user's own projects are scanned.
+    uid=None scans every project in the workspace (admin insights);
+    otherwise only the user's own projects are scanned. ws_id always
+    restricts the scan to one workspace.
     """
     if uid is None:
         rows = conn.execute(
@@ -30,8 +33,10 @@ def _duplicate_pairs(conn, uid=None, limit=10):
             SELECT d.id, d.filename, d.text, p.name AS project_name
             FROM documents d
             JOIN projects p ON p.id = d.project_id
-            WHERE d.is_current = 1 AND d.is_archived = 0 AND d.text != ''
-            """
+            WHERE p.workspace_id = ? AND d.is_current = 1 AND d.is_archived = 0
+              AND d.text != ''
+            """,
+            (ws_id,),
         ).fetchall()
     else:
         rows = conn.execute(
@@ -39,10 +44,10 @@ def _duplicate_pairs(conn, uid=None, limit=10):
             SELECT d.id, d.filename, d.text, p.name AS project_name
             FROM documents d
             JOIN projects p ON p.id = d.project_id
-            WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
-              AND d.text != ''
+            WHERE p.owner_id = ? AND p.workspace_id = ?
+              AND d.is_current = 1 AND d.is_archived = 0 AND d.text != ''
             """,
-            (uid,),
+            (uid, ws_id),
         ).fetchall()
     docs = [dict(r) for r in rows]
     if len(docs) < 2:
@@ -83,50 +88,87 @@ bp = Blueprint("knowledge", __name__)
 # --------------------------------------------------------------------------
 
 @bp.get("/api/search")
-@login_required
+@active_required
 def search():
+    """Hybrid search: keyword + semantic (LSA) embeddings.
+
+    Only documents in projects owned by the signed-in user (inside their
+    workspace) are considered, so results never leak documents the user
+    cannot access. Optional filters (category, type, project, uploader,
+    date range, tags) narrow the authorised set further.
+    """
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"results": []})
 
     conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT d.id AS document_id, d.filename, d.title,
-               p.id AS project_id, p.name AS project_name,
-               pg.page_number, pg.text
-        FROM document_pages pg
-        JOIN documents d ON d.id = pg.document_id
-        JOIN projects p ON p.id = d.project_id
-        WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
-          AND (pg.text LIKE ? OR d.filename LIKE ?)
-        ORDER BY d.created_at DESC
-        LIMIT 20
-        """,
-        (session["user_id"], f"%{q}%", f"%{q}%"),
-    ).fetchall()
-    conn.close()
-
-    results = []
-    for r in rows:
-        text = r["text"] or ""
-        idx = text.lower().find(q.lower())
-        if idx == -1:
-            idx = 0  # match came from the filename
-        start = max(0, idx - 120)
-        snippet = " ".join(text[start : start + 300].split())
-        results.append(
-            {
-                "document_id": r["document_id"],
-                "filename": r["filename"],
-                "title": r["title"],
-                "project_id": r["project_id"],
-                "project_name": r["project_name"],
-                "page_number": r["page_number"],
-                "snippet": snippet,
-            }
+    try:
+        ws_id = workspace_id(conn)
+        results = hybrid_search(
+            conn, session["user_id"], ws_id, q,
+            category=(request.args.get("category") or "").strip() or None,
+            doc_type=(request.args.get("type") or "").strip() or None,
+            project_id=(request.args.get("project_id") or "").strip() or None,
+            uploaded_by=(request.args.get("uploaded_by") or "").strip() or None,
+            date_from=(request.args.get("date_from") or "").strip() or None,
+            date_to=(request.args.get("date_to") or "").strip() or None,
+            tags=(request.args.get("tags") or "").strip() or None,
         )
-    return jsonify({"results": results})
+        log_activity(
+            conn, session["user_id"], "search",
+            f'Searched for "{q}"',
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"results": results, "query": q})
+
+
+@bp.get("/api/search/suggestions")
+@active_required
+def search_suggestions():
+    """Lightweight search suggestions from the user's own documents.
+
+    Returns up to 6 suggestion strings (titles, categories, tags) that match
+    the typed prefix. Only the signed-in user's authorised documents are
+    consulted, so suggestions can never leak another user's content.
+    """
+    q = (request.args.get("q") or "").strip().lower()
+    if len(q) < 1:
+        return jsonify({"suggestions": []})
+
+    conn = get_db()
+    try:
+        ws_id = workspace_id(conn)
+        rows = conn.execute(
+            """
+            SELECT d.title, d.category, d.tags
+            FROM documents d
+            JOIN projects p ON p.id = d.project_id
+            WHERE p.owner_id = ? AND p.workspace_id = ?
+              AND d.is_current = 1 AND d.is_archived = 0
+            """,
+            (session["user_id"], ws_id),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    suggestions = []
+    seen = set()
+    for r in rows:
+        for field in (r["title"], r["category"], r["tags"]):
+            if not field:
+                continue
+            for piece in field.split(","):
+                piece = piece.strip()
+                if not piece or piece.lower() in seen:
+                    continue
+                if piece.lower().startswith(q):
+                    seen.add(piece.lower())
+                    suggestions.append(piece)
+        if len(suggestions) >= 6:
+            break
+    return jsonify({"suggestions": suggestions[:6]})
 
 
 # --------------------------------------------------------------------------
@@ -134,17 +176,19 @@ def search():
 # --------------------------------------------------------------------------
 
 @bp.post("/api/documents/<int:doc_id>/related")
-@login_required
+@active_required
 def related(doc_id):
     conn = get_db()
+    ws_id = workspace_id(conn)
     target = conn.execute(
         """
         SELECT d.id, d.text
         FROM documents d
         JOIN projects p ON p.id = d.project_id
-        WHERE d.id = ? AND p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
+        WHERE d.id = ? AND p.owner_id = ? AND p.workspace_id = ?
+          AND d.is_current = 1 AND d.is_archived = 0
         """,
-        (doc_id, session["user_id"]),
+        (doc_id, session["user_id"], ws_id),
     ).fetchone()
     if not target:
         conn.close()
@@ -156,11 +200,17 @@ def related(doc_id):
                p.id AS project_id, p.name AS project_name
         FROM documents d
         JOIN projects p ON p.id = d.project_id
-        WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
-          AND d.id != ?
+        WHERE p.owner_id = ? AND p.workspace_id = ?
+          AND d.is_current = 1 AND d.is_archived = 0 AND d.id != ?
         """,
-        (session["user_id"], doc_id),
+        (session["user_id"], ws_id, doc_id),
     ).fetchall()
+    log_activity(
+        conn, session["user_id"], "knowledge_access",
+        f'Explored related documents for "{target["title"] or target["filename"]}"',
+        ref_type="document", ref_id=doc_id,
+    )
+    conn.commit()
     conn.close()
 
     docs = [dict(r) for r in rows]
@@ -198,13 +248,11 @@ def related(doc_id):
 # --------------------------------------------------------------------------
 
 @bp.get("/api/knowledge-gaps")
-@login_required
+@active_required
 def knowledge_gaps():
     conn = get_db()
-    row = conn.execute(
-        "SELECT is_admin FROM users WHERE id = ?", (session["user_id"],)
-    ).fetchone()
-    if not row or not row["is_admin"]:
+    ws_id = workspace_id(conn)
+    if not is_admin(conn, ws_id):
         conn.close()
         return jsonify({"error": "Admin access required"}), 403
 
@@ -212,10 +260,12 @@ def knowledge_gaps():
         """
         SELECT question, COUNT(*) AS occurrences, MAX(asked_at) AS last_asked
         FROM knowledge_gaps
+        WHERE workspace_id = ?
         GROUP BY question
         ORDER BY occurrences DESC, last_asked DESC
         LIMIT 50
-        """
+        """,
+        (ws_id,),
     ).fetchall()
     conn.close()
     return jsonify({"gaps": [dict(g) for g in gaps]})
@@ -226,21 +276,24 @@ def knowledge_gaps():
 # --------------------------------------------------------------------------
 
 @bp.get("/api/dashboard")
-@login_required
+@active_required
 def dashboard():
     uid = session["user_id"]
     conn = get_db()
+    ws_id = workspace_id(conn)
 
     projects_count = conn.execute(
-        "SELECT COUNT(*) FROM projects WHERE owner_id = ?", (uid,)
+        "SELECT COUNT(*) FROM projects WHERE owner_id = ? AND workspace_id = ?",
+        (uid, ws_id),
     ).fetchone()[0]
     documents_count = conn.execute(
         """
         SELECT COUNT(*) FROM documents d
         JOIN projects p ON p.id = d.project_id
-        WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
+        WHERE p.owner_id = ? AND p.workspace_id = ?
+          AND d.is_current = 1 AND d.is_archived = 0
         """,
-        (uid,),
+        (uid, ws_id),
     ).fetchone()[0]
 
     recent_uploads = conn.execute(
@@ -249,11 +302,12 @@ def dashboard():
                p.name AS project_name
         FROM documents d
         JOIN projects p ON p.id = d.project_id
-        WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
+        WHERE p.owner_id = ? AND p.workspace_id = ?
+          AND d.is_current = 1 AND d.is_archived = 0
         ORDER BY d.created_at DESC
         LIMIT 5
         """,
-        (uid,),
+        (uid, ws_id),
     ).fetchall()
 
     recent_updates = conn.execute(
@@ -262,22 +316,22 @@ def dashboard():
                p.name AS project_name
         FROM documents d
         JOIN projects p ON p.id = d.project_id
-        WHERE p.owner_id = ? AND d.is_current = 1 AND d.is_archived = 0
-          AND d.version > 1
+        WHERE p.owner_id = ? AND p.workspace_id = ?
+          AND d.is_current = 1 AND d.is_archived = 0 AND d.version > 1
         ORDER BY d.created_at DESC
         LIMIT 5
         """,
-        (uid,),
+        (uid, ws_id),
     ).fetchall()
 
     recent_gaps = conn.execute(
         """
         SELECT question, asked_at FROM knowledge_gaps
-        WHERE user_id = ?
+        WHERE user_id = ? AND workspace_id = ?
         ORDER BY asked_at DESC
         LIMIT 5
         """,
-        (uid,),
+        (uid, ws_id),
     ).fetchall()
     conn.close()
 
@@ -288,7 +342,9 @@ def dashboard():
             "recent_uploads": [dict(r) for r in recent_uploads],
             "recent_updates": [dict(r) for r in recent_updates],
             "recent_gaps": [dict(r) for r in recent_gaps],
-            "potential_duplicates": _duplicate_pairs(get_db(), uid=uid, limit=5),
+            "potential_duplicates": _duplicate_pairs(
+                get_db(), uid=uid, ws_id=ws_id, limit=5
+            ),
         }
     )
 
@@ -298,41 +354,49 @@ def dashboard():
 # --------------------------------------------------------------------------
 
 def _require_admin(conn):
-    row = conn.execute(
-        "SELECT is_admin FROM users WHERE id = ?", (session["user_id"],)
-    ).fetchone()
-    return bool(row and row["is_admin"])
+    """True if the signed-in user is an admin of their own workspace."""
+    ws_id = workspace_id(conn)
+    return is_admin(conn, ws_id)
 
 
 @bp.get("/api/admin/users")
-@login_required
+@active_required
 def admin_users():
     conn = get_db()
+    ws_id = workspace_id(conn)
     if not _require_admin(conn):
         conn.close()
         return jsonify({"error": "Admin access required"}), 403
 
     rows = conn.execute(
         """
-        SELECT u.id, u.username, u.full_name, u.is_admin, u.created_at,
-               (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id)
+        SELECT u.id, u.username, u.full_name, u.email, u.is_admin,
+               u.status, u.terms_accepted, u.security_agreed,
+               u.position, u.department, u.employee_id, u.phone,
+               u.created_at, u.approved_at, u.rejected_reason, u.suspended_reason,
+               (SELECT COUNT(*) FROM projects p WHERE p.owner_id = u.id
+                AND p.workspace_id = u.workspace_id)
                    AS project_count,
                (SELECT COUNT(*) FROM documents d
                 JOIN projects p ON p.id = d.project_id
-                WHERE p.owner_id = u.id AND d.is_current = 1 AND d.is_archived = 0)
+                WHERE p.owner_id = u.id AND p.workspace_id = u.workspace_id
+                  AND d.is_current = 1 AND d.is_archived = 0)
                    AS document_count
         FROM users u
+        WHERE u.workspace_id = ?
         ORDER BY u.created_at
-        """
+        """,
+        (ws_id,),
     ).fetchall()
     conn.close()
     return jsonify({"users": [dict(r) for r in rows]})
 
 
 @bp.post("/api/admin/users/<int:user_id>/admin")
-@login_required
+@active_required
 def toggle_admin(user_id):
     conn = get_db()
+    ws_id = workspace_id(conn)
     if not _require_admin(conn):
         conn.close()
         return jsonify({"error": "Admin access required"}), 403
@@ -341,7 +405,8 @@ def toggle_admin(user_id):
         return jsonify({"error": "You cannot change your own admin status"}), 400
 
     row = conn.execute(
-        "SELECT id, username, is_admin FROM users WHERE id = ?", (user_id,)
+        "SELECT id, username, is_admin FROM users WHERE id = ? AND workspace_id = ?",
+        (user_id, ws_id),
     ).fetchone()
     if not row:
         conn.close()
@@ -356,14 +421,113 @@ def toggle_admin(user_id):
     )
 
 
+def _admin_target(conn, user_id):
+    """Shared guard for account-status actions.
+
+    The target must belong to the admin's own workspace. Returns
+    (error_response, target_row); error_response is None on success.
+    """
+    ws_id = workspace_id(conn)
+    if not _require_admin(conn):
+        return (jsonify({"error": "Admin access required"}), 403), None
+    if user_id == session["user_id"]:
+        return (jsonify({"error": "You cannot change your own account status"}), 400), None
+    row = conn.execute(
+        "SELECT id, username, status FROM users WHERE id = ? AND workspace_id = ?",
+        (user_id, ws_id),
+    ).fetchone()
+    if not row:
+        return (jsonify({"error": "User not found"}), 404), None
+    return None, row
+
+
+@bp.post("/api/admin/users/<int:user_id>/approve")
+@active_required
+def approve_user(user_id):
+    conn = get_db()
+    err, row = _admin_target(conn, user_id)
+    if err:
+        conn.close()
+        return err
+    conn.execute(
+        "UPDATE users SET status = 'active', approved_by = ?, "
+        "approved_at = datetime('now'), rejected_reason = NULL, "
+        "suspended_reason = NULL WHERE id = ?",
+        (session["user_id"], user_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "username": row["username"], "status": "active"})
+
+
+@bp.post("/api/admin/users/<int:user_id>/reject")
+@active_required
+def reject_user(user_id):
+    data = request.get_json(force=True) or {}
+    reason = (data.get("reason") or "").strip()[:300]
+    conn = get_db()
+    err, row = _admin_target(conn, user_id)
+    if err:
+        conn.close()
+        return err
+    conn.execute(
+        "UPDATE users SET status = 'rejected', rejected_reason = ?, "
+        "suspended_reason = NULL WHERE id = ?",
+        (reason or None, user_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "username": row["username"], "status": "rejected"})
+
+
+@bp.post("/api/admin/users/<int:user_id>/suspend")
+@active_required
+def suspend_user(user_id):
+    data = request.get_json(force=True) or {}
+    reason = (data.get("reason") or "").strip()[:300]
+    conn = get_db()
+    err, row = _admin_target(conn, user_id)
+    if err:
+        conn.close()
+        return err
+    conn.execute(
+        "UPDATE users SET status = 'suspended', suspended_reason = ?, "
+        "rejected_reason = NULL WHERE id = ?",
+        (reason or None, user_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "username": row["username"], "status": "suspended"})
+
+
+@bp.post("/api/admin/users/<int:user_id>/reactivate")
+@active_required
+def reactivate_user(user_id):
+    conn = get_db()
+    err, row = _admin_target(conn, user_id)
+    if err:
+        conn.close()
+        return err
+    conn.execute(
+        "UPDATE users SET status = 'active', approved_by = ?, "
+        "approved_at = datetime('now'), rejected_reason = NULL, "
+        "suspended_reason = NULL WHERE id = ?",
+        (session["user_id"], user_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "username": row["username"], "status": "active"})
+
+
 # --------------------------------------------------------------------------
 # Admin — knowledge insights (gaps + duplicates across all projects)
 # --------------------------------------------------------------------------
 
 @bp.get("/api/admin/insights")
-@login_required
+@active_required
 def admin_insights():
     conn = get_db()
+    ws_id = workspace_id(conn)
     if not _require_admin(conn):
         conn.close()
         return jsonify({"error": "Admin access required"}), 403
@@ -372,16 +536,18 @@ def admin_insights():
         """
         SELECT question, COUNT(*) AS occurrences, MAX(asked_at) AS last_asked
         FROM knowledge_gaps
+        WHERE workspace_id = ?
         GROUP BY question
         ORDER BY occurrences DESC, last_asked DESC
         LIMIT 50
-        """
+        """,
+        (ws_id,),
     ).fetchall()
     conn.close()
 
     return jsonify(
         {
             "gaps": [dict(g) for g in gaps],
-            "duplicates": _duplicate_pairs(get_db(), uid=None, limit=10),
+            "duplicates": _duplicate_pairs(get_db(), uid=None, ws_id=ws_id, limit=10),
         }
     )

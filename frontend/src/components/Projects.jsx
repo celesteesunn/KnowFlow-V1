@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api.js'
+import { setUnsaved } from '../unsaved.js'
 
 export default function Projects({ user, onOpen }) {
   const [projects, setProjects] = useState([])
@@ -18,12 +19,16 @@ export default function Projects({ user, onOpen }) {
     load()
   }, [])
 
+  // Clear the unsaved flag when the projects view unmounts.
+  useEffect(() => () => setUnsaved('project-create', false), [])
+
   const create = async (e) => {
     e.preventDefault()
     setBusy(true)
     setError(null)
     try {
       await api.createProject({ name, description })
+      setUnsaved('project-create', false)
       setName('')
       setDescription('')
       await load()
@@ -46,13 +51,19 @@ export default function Projects({ user, onOpen }) {
             <input
               placeholder="Project name"
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value)
+                setUnsaved('project-create', true)
+              }}
               required
             />
             <input
               placeholder="Description (optional)"
               value={description}
-              onChange={(e) => setDescription(e.target.value)}
+              onChange={(e) => {
+                setDescription(e.target.value)
+                setUnsaved('project-create', true)
+              }}
             />
             {error && <p className="error-text">{error}</p>}
             <button className="btn btn-primary" disabled={busy}>

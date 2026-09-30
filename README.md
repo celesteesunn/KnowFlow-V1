@@ -27,18 +27,27 @@ source document and page.
 
 ## Features
 
-- **Authentication** — register, log in, log out (session cookies, hashed
-  passwords with werkzeug scrypt). Usernames are validated; passwords must be
-  6-128 characters.
+- **Authentication** — register with email + password, acceptance of Terms &
+  Conditions and a Security & Confidentiality agreement, then organisation
+  approval by an administrator before the account becomes active. Account
+  statuses: pending approval, active, rejected, suspended. Restrictions are
+  enforced in the backend — pending, rejected and suspended accounts can never
+  reach the application endpoints. The very first registered account is the
+  bootstrap admin (active immediately) so the system can never run without an
+  administrator. Session cookies, hashed passwords (werkzeug scrypt).
+  Usernames are validated; passwords must be 6-128 characters.
 - **Projects** — create and view your own knowledge projects. Users never see
   other users' projects.
 - **Dashboard** — real statistics: project and document counts, recently
   uploaded, recently updated (new versions), recent unanswered questions and
   potential duplicates, all computed live from the database.
 - **Document management**
-  - PDF upload with metadata (title, description, category)
-  - PDF validation: extension check, readable content check, 20 MB size limit,
-    rejection of invalid, corrupted, empty and text-less PDFs
+  - PDF, DOCX and TXT upload with metadata (title, description, category, tags)
+  - Upload validation: extension check, readable content check, 500 MB per-file
+    size limit enforced on the frontend and the backend, rejection of invalid,
+    corrupted, empty and text-less files
+  - Multiple files can be selected at once; the size limit applies per file and
+    any file over the limit is rejected by name
   - Per-project document list: title, uploader, date, version, status
   - Document details with full metadata and version history
   - Open/download the stored PDF
@@ -57,8 +66,10 @@ source document and page.
   documents (≥ 10% similarity) from the user's own projects.
 - **Knowledge gaps** — unanswered AI questions are recorded; admins see
   frequently unanswered questions with occurrence counts.
-- **Admin (user management)** — admins see all users with project/document
-  counts and can grant or remove admin roles (cannot change their own role).
+- **Admin (user management)** — admins see all users with email, account
+  status, verification/agreement flags and project/document counts; they can
+  approve pending registrations, reject, suspend and reactivate accounts, and
+  grant or remove admin roles (cannot change their own role).
 - **Knowledge Insights (admin)** — frequently unanswered questions and
   potential duplicate pairs across all projects.
 
@@ -80,7 +91,8 @@ Browser (React SPA on :5173)
         │  /api/*  (Vite dev proxy)
         ▼
 Flask backend (:5000)
-  ├── auth.py        register / login / logout / me (session cookies)
+  ├── auth.py        register, agreements, login/logout,
+  │                  profile, me + active_required gate (session cookies)
   ├── projects.py    project list + create (owner-scoped)
   ├── documents.py   upload, list, detail, download, replace, archive,
   │                  permanent delete, search, ask, duplicates (owner-scoped)
@@ -99,16 +111,19 @@ restricted to the local dev servers.
 
 ## Workflow
 
-1. A user registers or logs in (session cookie set).
-2. The user creates a project.
-3. The user uploads a PDF. The backend validates it, extracts text per page,
+1. A user registers with email + password.
+2. The user accepts the Terms & Conditions and the Security & Confidentiality
+   agreement, and waits for an administrator to approve the account.
+3. Once active, the user signs in and completes their profile.
+4. The user creates a project.
+5. The user uploads a PDF. The backend validates it, extracts text per page,
    chunks and embeds the text, stores everything in SQLite, and checks the new
    document against existing ones for potential duplicates.
-4. The user can search the project, search globally, view related documents,
+6. The user can search the project, search globally, view related documents,
    and ask the AI assistant questions.
-5. A question is answered from the project's own documents only; the answer
+7. A question is answered from the project's own documents only; the answer
    cites the source document and page.
-6. Questions the AI cannot answer are recorded as knowledge gaps, visible to
+8. Questions the AI cannot answer are recorded as knowledge gaps, visible to
    admins.
 
 ## RAG workflow
@@ -132,7 +147,7 @@ Question → embedded the same way → cosine similarity → top-3 chunks
 
 | Table             | Purpose                                              |
 | ----------------- | ---------------------------------------------------- |
-| `users`           | Accounts: username, scrypt password hash, is_admin   |
+| `users`           | Accounts: username, email, scrypt password hash, is_admin, account status, agreement flags, approval metadata |
 | `projects`        | Knowledge projects, owned by a user                  |
 | `documents`       | PDFs: metadata, version, status, file path, text     |
 | `document_pages`  | Extracted text per page                              |
@@ -140,7 +155,9 @@ Question → embedded the same way → cosine similarity → top-3 chunks
 | `knowledge_gaps`  | Unanswered AI questions (user, project, timestamp)   |
 
 The schema is created and migrated automatically on startup. The first
-registered account is made an admin.
+registered account is the bootstrap admin (active immediately at
+registration); accounts created before the auth flow was introduced are
+migrated to active automatically (one-time, gated by `PRAGMA user_version`).
 
 ## Data Science features
 
@@ -231,8 +248,11 @@ python app.py
 | Method | Endpoint                              | Description                          |
 | ------ | ------------------------------------- | ------------------------------------ |
 | GET    | `/api/health`                         | Service status, version, DB check    |
-| POST   | `/api/auth/register`                  | Create account (sets session)        |
-| POST   | `/api/auth/login`                     | Sign in (sets session)               |
+| POST   | `/api/auth/register`                  | Create account with email (sets session; first account is the bootstrap admin, others start pending approval) |
+| POST   | `/api/auth/accept-terms`              | Accept Terms & Conditions              |
+| POST   | `/api/auth/accept-security`           | Accept Security & Confidentiality agreement |
+| POST   | `/api/auth/profile`                   | Update full name / email               |
+| POST   | `/api/auth/login`                     | Sign in by username or email (sets session; rejected/suspended → 403) |
 | POST   | `/api/auth/logout`                    | Sign out                             |
 | GET    | `/api/auth/me`                        | Current user (or null)               |
 | GET    | `/api/projects`                       | List own projects + document counts  |
@@ -253,14 +273,21 @@ python app.py
 | POST   | `/api/chat`                           | RAG chat: `{project_id, question}` → answer + sources (owner only) |
 | GET    | `/api/projects/<id>/duplicates`       | Near-duplicate document pairs        |
 | GET    | `/api/knowledge-gaps`                 | Frequently unanswered questions (admin only) |
-| GET    | `/api/admin/users`                    | All users with counts (admin only)   |
+| GET    | `/api/admin/users`                    | All users with status + counts (admin only) |
 | POST   | `/api/admin/users/<id>/admin`         | Grant/remove admin role (admin only, not self) |
+| POST   | `/api/admin/users/<id>/approve`       | Approve a pending account (admin only, not self) |
+| POST   | `/api/admin/users/<id>/reject`        | Reject an account with reason (admin only, not self) |
+| POST   | `/api/admin/users/<id>/suspend`       | Suspend an account with reason (admin only, not self) |
+| POST   | `/api/admin/users/<id>/reactivate`    | Reactivate a suspended account (admin only, not self) |
 | GET    | `/api/admin/insights`                 | Gaps + duplicate pairs across all projects (admin only) |
 
 All endpoints except `/api/health` and `/api/auth/*` require an authenticated
-session. Every project and document endpoint is owner-scoped: accessing another
-user's project or document returns 404. Admin endpoints return 403 for
-non-admins.
+session, and every application endpoint additionally requires an **active**
+account (agreements accepted, approved, not suspended or rejected) — blocked
+accounts receive 403 with a machine-readable `code` (`terms_required`,
+`security_required`, `pending_approval`, `rejected`, `suspended`). Every
+project and document endpoint is owner-scoped: accessing another user's
+project or document returns 404. Admin endpoints return 403 for non-admins.
 
 ## Testing instructions
 
@@ -269,6 +296,14 @@ The application was verified end-to-end with live API tests covering:
 - **Authentication** — valid login, invalid login (wrong password and unknown
   user both return 401), protected pages without a session return 401, logout
   clears the session.
+- **Account lifecycle** — registration requires a valid email; the first
+  registered account becomes the bootstrap admin (active immediately, no
+  verification step); every other account starts as `pending_approval`; terms
+  and security agreements are enforced in order (403 `terms_required` →
+  `security_required`); pending accounts are blocked (403 `pending_approval`)
+  until an admin approves them; rejected and suspended accounts cannot log in
+  (403 with code) and are blocked mid-session; duplicate usernames and emails
+  return 409; login works by username or email.
 - **Authorisation** — a fresh employee sees no projects, cannot list, view,
   download, upload to, delete, chat with or search another user's projects or
   documents (all 404), and is blocked from every admin endpoint (403). Admins
